@@ -4,22 +4,14 @@ pdf_to_xlsx.py — Converte PDFs de ensaios GENVCE em XLSX formatado.
 
 Uso:
     python pdf_to_xlsx.py <arquivo.pdf> [saida.xlsx] [--logo logo.png]
-
-Exemplos:
-    python pdf_to_xlsx.py ensaio.pdf
-    python pdf_to_xlsx.py ensaio.pdf resultado.xlsx
-    python pdf_to_xlsx.py ensaio.pdf resultado.xlsx --logo genvce.jpeg
 """
-
-import sys
-import re
-import argparse
+import sys, re, argparse
 from pathlib import Path
 
 try:
     import pdfplumber
 except ImportError:
-    sys.exit("Erro: instale pdfplumber com:  pip install pdfplumber")
+    sys.exit("Erro: pip install pdfplumber")
 
 try:
     import openpyxl
@@ -28,28 +20,24 @@ try:
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.utils import get_column_letter
 except ImportError:
-    sys.exit("Erro: instale openpyxl com:  pip install openpyxl")
-
+    sys.exit("Erro: pip install openpyxl")
 
 # ── Estilos ───────────────────────────────────────────────────────────────────
-
 GREEN_HDR  = '388E3C'
 GREEN_EVEN = 'F1F8E9'
 WHITE      = 'FFFFFF'
-GRAY_TEXT  = '444444'
 
-def fill(color):
-    return PatternFill('solid', fgColor=color)
+def fill(color): return PatternFill('solid', fgColor=color)
 
-def style_header_cell(cell, text, num_cols=1):
+def style_header_cell(cell, text):
     cell.value = text
     cell.font = Font(bold=True, size=10, color='FFFFFF', name='Arial')
     cell.fill = fill(GREEN_HDR)
     cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-def style_data_cell(cell, value, zebra=False, align='center', bold=False, size=10):
+def style_data_cell(cell, value, zebra=False, align='center'):
     cell.value = value
-    cell.font = Font(size=size, bold=bold, name='Arial', color=GRAY_TEXT if not bold else '000000')
+    cell.font = Font(size=10, name='Arial')
     cell.fill = fill(GREEN_EVEN if zebra else WHITE)
     cell.alignment = Alignment(horizontal=align, vertical='center')
 
@@ -63,171 +51,163 @@ def style_meta_cell(cell, value, size=9, bold=False):
     cell.font = Font(size=size, bold=bold, name='Arial')
     cell.alignment = Alignment(horizontal='left', vertical='center')
 
+# ── Parser por posição de palavras (sem extract_tables) ───────────────────────
+def try_numeric(s):
+    s = str(s or '').strip()
+    try: return int(s)
+    except: pass
+    try: return float(s.replace(',', '.'))
+    except: pass
+    return s if s else None
 
-# ── Extração do PDF ───────────────────────────────────────────────────────────
+STAT_KEYS = {'media', 'desviación', 'coeficiente', 'diseño'}
+META_RE   = re.compile(r'instituto|iriaf|itacyl|fecha de|siembra|cosecha', re.I)
+HDR_RE    = re.compile(r'kg/ha|índice|grupo|nascen|espigad|encamad|rendimi|humedad|altura|daños|frío', re.I)
 
-def try_numeric(val):
-    """Tenta converter string para int ou float."""
-    if val is None:
-        return None
-    s = str(val).strip()
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s.replace(',', '.'))
-    except ValueError:
-        pass
-    return s
+def group_rows(words, y_tol=4):
+    if not words: return []
+    rows, cur_y, cur = [], None, []
+    for w in sorted(words, key=lambda w: (round(w['top']/y_tol), w['x0'])):
+        y = round(w['top']/y_tol)
+        if cur_y is None or y != cur_y:
+            if cur: rows.append(cur)
+            cur, cur_y = [w], y
+        else:
+            cur.append(w)
+    if cur: rows.append(cur)
+    return rows
 
-def parse_page(page):
-    """
-    Retorna dict com:
-      - title:   título do documento (cabeçalho repetido em todas as páginas)
-      - section: subtítulo/seção da página
-      - headers: lista de cabeçalhos da tabela
-      - rows:    lista de listas com dados
-      - stats:   lista de (label, valor) para bloco de estatísticas
-      - footnote: texto de rodapé
-    """
-    raw_tables = page.extract_tables()
-    full_text  = page.extract_text() or ''
-    lines      = [l.strip() for l in full_text.splitlines() if l.strip()]
+def chunk_row(word_row, gap=12):
+    if not word_row: return []
+    chunks, cur = [], [word_row[0]]
+    for w in word_row[1:]:
+        if w['x0'] - cur[-1]['x1'] > gap:
+            chunks.append(cur); cur = [w]
+        else:
+            cur.append(w)
+    chunks.append(cur)
+    return chunks
 
-    result = {
-        'title':    lines[0] if lines else '',
-        'section':  '',
-        'headers':  [],
-        'rows':     [],
-        'stats':    [],
-        'footnote': '',
-    }
+def chunk_text(chunk):  return ' '.join(w['text'] for w in chunk)
+def chunk_center(chunk): return (chunk[0]['x0'] + chunk[-1]['x1']) / 2
 
-    if not raw_tables:
-        # Página só de texto
-        result['section'] = lines[1] if len(lines) > 1 else ''
-        return result
-
-    table = raw_tables[0]
-
-    # Identifica seção e cabeçalho da tabela
-    data_start = 0
-    for i, row in enumerate(table):
-        non_null = [c for c in row if c and str(c).strip()]
-        # Linha de seção: só col 0 preenchida, sem dados numéricos
-        if len(non_null) == 1 and i <= 1:
-            text = non_null[0].strip()
-            # Ignora blocos de texto longo (metadados do documento)
-            if len(text.splitlines()) == 1 and len(text) < 80:
-                result['section'] = text
-            data_start = i + 1
-            continue
-        # Linha de cabeçalho real: primeira célula vazia, resto preenchido
-        if not (row[0] or '').strip() and any(row[1:]):
-            result['headers'] = ['VARIEDAD'] + [c.strip() for c in row[1:] if c]
-            data_start = i + 1
-            break
-
-    # Separa linhas de dados das linhas de estatísticas
-    stat_labels = {'media', 'desviación', 'coeficiente', 'diseño', 'variedad testigo'}
-    for row in table[data_start:]:
-        if not any(row):
-            continue
-        first = str(row[0] or '').strip()
-        if not first:
-            continue
-        # Rodapé
-        if first.startswith('*') and ':' in first:
-            result['footnote'] = first
-            continue
-        # Estatística
-        if any(s in first.lower() for s in stat_labels):
-            val = try_numeric(row[1]) if len(row) > 1 else None
-            result['stats'].append((first, val if val is not None else (row[1] or '')))
-            continue
-        # Linha de dados
-        result['rows'].append([try_numeric(c) if i > 0 else (c or '') for i, c in enumerate(row)])
-
-    # Se seção não encontrada na tabela, busca nas linhas de texto
-    if not result['section']:
-        for line in lines:
-            # Linha que parece título de seção: não contém datas, não é o título principal, não é nome de variedad
-            if (len(line) > 10 and len(line) < 100
-                    and not re.search(r'\d{4}|fecha|ensayo en|instituto|iriaf|itacyl', line.lower())
-                    and not line.isupper()):
-                result['section'] = line
-                break
-
-    # Rodapé no texto da página se não encontrado na tabela
-    if not result['footnote']:
-        for line in reversed(lines):
-            if line.startswith('*') and 'testigo' in line.lower():
-                result['footnote'] = line
-                break
-
+def assign_to_cols(value_chunks, col_centers):
+    result = [None] * len(col_centers)
+    for vc in value_chunks:
+        cx = chunk_center(vc)
+        nearest = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - cx))
+        result[nearest] = chunk_text(vc)
     return result
 
+def parse_page(page):
+    words = page.extract_words(keep_blank_chars=False, x_tolerance=2, y_tolerance=3)
+    word_rows = group_rows(words, y_tol=4)
+    result = {'title':'', 'section':'', 'instituto':'', 'dates':[],
+              'headers':[], 'col_centers':[], 'rows':[], 'stats':[], 'footnote':''}
+    state = 'meta'
+    VARIETY_X_MAX = 120
+
+    for word_row in word_rows:
+        chunks = chunk_row(word_row, gap=12)
+        text   = ' '.join(chunk_text(c) for c in chunks)
+        x0     = word_row[0]['x0']
+
+        if not result['title'] and x0 > 100 and 'Ensayo' in text:
+            result['title'] = text; continue
+        if text.strip().startswith('*') and 'testigo' in text.lower():
+            result['footnote'] = text.strip(); continue
+        if META_RE.search(text):
+            if re.search(r'instituto|iriaf|itacyl', text, re.I): result['instituto'] = text
+            else: result['dates'].append(text)
+            continue
+        if (state == 'meta' and not result['section'] and x0 < 80
+                and 8 < len(text) < 90
+                and not re.search(r'\d{4}|ensayo en|secanos', text, re.I)
+                and not text.isupper()):
+            result['section'] = text; continue
+        if state == 'data' and any(k in text.lower() for k in STAT_KEYS):
+            left  = [c for c in chunks if c[0]['x0'] < 250]
+            right = [c for c in chunks if c[0]['x0'] >= 250]
+            label = ' '.join(chunk_text(c) for c in left).strip()
+            val   = try_numeric(' '.join(chunk_text(c) for c in right).strip())
+            result['stats'].append((label or text, val if val is not None else ' '.join(chunk_text(c) for c in right)))
+            continue
+        if state in ('meta','header') and HDR_RE.search(text) and len(chunks) >= 2:
+            data_chunks = [c for c in chunks if c[0]['x0'] > VARIETY_X_MAX - 20]
+            if not data_chunks: continue
+            result['col_centers'] = [chunk_center(c) for c in data_chunks]
+            result['headers'] = ['VARIEDAD'] + [chunk_text(c) for c in data_chunks]
+            state = 'data'; continue
+        if state == 'data' and result['col_centers'] and x0 < VARIETY_X_MAX:
+            variety_chunks = [c for c in chunks if c[-1]['x1'] < result['col_centers'][0] - 5]
+            data_chunks    = [c for c in chunks if c[0]['x0'] >= result['col_centers'][0] - 15]
+            variety = ' '.join(chunk_text(c) for c in variety_chunks).strip()
+            if not variety and chunks:
+                variety = chunk_text(chunks[0]); data_chunks = chunks[1:]
+            values = assign_to_cols(data_chunks, result['col_centers'])
+            row = [variety] + [try_numeric(v) for v in values]
+            result['rows'].append(row)
+
+    result['dates_str'] = '  |  '.join(result['dates'])
+    return result
+
+def extract_doc_meta(first_page):
+    words = first_page.extract_words()
+    word_rows = group_rows(words)
+    meta = {'title':'', 'instituto':'', 'dates_str':''}
+    dates = []
+    for wr in word_rows:
+        text = ' '.join(w['text'] for w in wr)
+        if not meta['title'] and 'Ensayo' in text and wr[0]['x0'] > 100:
+            meta['title'] = text
+        if META_RE.search(text):
+            if re.search(r'instituto|iriaf|itacyl', text, re.I): meta['instituto'] = text
+            elif re.search(r'fecha|siembra|cosecha', text, re.I): dates.append(text)
+    meta['dates_str'] = '  |  '.join(dates)
+    return meta
 
 # ── Escrita do XLSX ───────────────────────────────────────────────────────────
-
 def write_sheet(ws, page_data, doc_meta, logo_path=None):
-    """Escreve uma aba do XLSX com base nos dados extraídos da página."""
-
-    # Linha 1: logo (se disponível) + título do documento no cabeçalho
     ws.row_dimensions[1].height = 22
-    ws.row_dimensions[2].height = 6
-    ws.row_dimensions[3].height = 6
-    ws.row_dimensions[4].height = 6
+    for r in [2,3,4]: ws.row_dimensions[r].height = 6
 
     if logo_path and Path(logo_path).exists():
-        img = XLImage(logo_path)
-        img.width  = 120
-        img.height = 23
-        img.anchor = 'A1'
+        img = XLImage(str(logo_path))
+        img.width = 120; img.height = 23; img.anchor = 'A1'
         ws.add_image(img)
 
-    # Metadados (linhas 5-7)
-    title_text = page_data['title'] or doc_meta.get('title', '')
-    if page_data['section']:
-        title_text = f"{doc_meta.get('base_title', title_text)} – {page_data['section']}"
+    section    = page_data.get('section', '')
+    base_title = doc_meta.get('title', page_data['title'])
+    full_title = f"{base_title} – {section}" if section else base_title
 
     ws.row_dimensions[5].height = 18
-    style_meta_cell(ws['A5'], title_text, size=13, bold=True)
-
+    style_meta_cell(ws['A5'], full_title, size=13, bold=True)
     ws.row_dimensions[6].height = 13
-    style_meta_cell(ws['A6'], doc_meta.get('instituto', ''), size=9)
-
+    style_meta_cell(ws['A6'], doc_meta.get('instituto', page_data.get('instituto','')), size=9)
     ws.row_dimensions[7].height = 13
-    style_meta_cell(ws['A7'], doc_meta.get('dates', ''), size=9)
-
-    # Subtítulo da seção (linha 8) se diferente do título
-    if page_data['section']:
+    style_meta_cell(ws['A7'], doc_meta.get('dates_str', page_data.get('dates_str','')), size=9)
+    if section:
         ws.row_dimensions[8].height = 16
-        style_meta_cell(ws['A8'], page_data['section'], size=11, bold=True)
+        style_meta_cell(ws['A8'], section, size=11, bold=True)
 
-    # Cabeçalho da tabela (linha 9)
-    HDR_ROW = 9
     headers = page_data['headers']
-    if not headers:
-        return
+    if not headers: return
 
+    HDR_ROW = 9
     ws.row_dimensions[HDR_ROW].height = 30
     for c, h in enumerate(headers, 1):
         style_header_cell(ws.cell(HDR_ROW, c), h)
 
-    # Dados
     for i, row in enumerate(page_data['rows']):
         r = HDR_ROW + 1 + i
         zebra = i % 2 != 0
         ws.row_dimensions[r].height = 15
-        for c, val in enumerate(row):
-            align = 'left' if c == 0 else 'center'
-            style_data_cell(ws.cell(r, c + 1), val, zebra=zebra, align=align)
+        while len(row) < len(headers): row.append(None)
+        for c, val in enumerate(row[:len(headers)]):
+            style_data_cell(ws.cell(r, c+1), val, zebra=zebra, align='left' if c==0 else 'center')
 
     last_data = HDR_ROW + len(page_data['rows'])
 
-    # Estatísticas
     if page_data['stats']:
         r = last_data + 2
         for label, val in page_data['stats']:
@@ -235,93 +215,52 @@ def write_sheet(ws, page_data, doc_meta, logo_path=None):
             style_stat_cell(ws.cell(r, 2), val, align='center')
             r += 1
 
-    # Rodapé
-    footnote_row = last_data + len(page_data['stats']) + 3
-    if page_data['footnote']:
-        ws.cell(footnote_row, 1).value = page_data['footnote']
-        ws.cell(footnote_row, 1).font = Font(size=9, name='Arial')
+    if page_data.get('footnote'):
+        fn_row = last_data + len(page_data['stats']) + 3
+        ws.cell(fn_row, 1).value = page_data['footnote']
+        ws.cell(fn_row, 1).font = Font(size=9, name='Arial')
 
-    # Larguras de coluna automáticas
-    num_cols = len(headers)
-    for c in range(1, num_cols + 1):
-        col_letter = get_column_letter(c)
-        lengths = [len(str(headers[c-1])) if headers[c-1] else 0]
-        lengths += [len(str(row[c-1])) if c-1 < len(row) and row[c-1] else 0
-                    for row in page_data['rows']]
-        max_len = max(lengths) if lengths else 10
-        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 45)
-
-
-def extract_doc_meta(first_page_text):
-    """Extrai metadados gerais do documento a partir da primeira página."""
-    lines = [l.strip() for l in first_page_text.splitlines() if l.strip()]
-    meta = {
-        'title':       lines[0] if lines else '',
-        'base_title':  lines[0] if lines else '',
-        'instituto':   '',
-        'dates':       '',
-    }
-    date_parts = []
-    for line in lines:
-        if 'instituto' in line.lower() or 'iriaf' in line.lower() or 'itacyl' in line.lower():
-            meta['instituto'] = line
-        if re.search(r'fecha|siembra|cosecha', line.lower()):
-            date_parts.append(line)
-    if date_parts:
-        meta['dates'] = '  |  '.join(date_parts)
-    return meta
-
+    for c in range(1, len(headers)+1):
+        lengths = [len(str(headers[c-1]))]
+        for row in page_data['rows']:
+            if c-1 < len(row) and row[c-1] is not None:
+                lengths.append(len(str(row[c-1])))
+        ws.column_dimensions[get_column_letter(c)].width = min(max(max(lengths)+3, 12), 45)
 
 # ── Ponto de entrada ──────────────────────────────────────────────────────────
-
 def convert(pdf_path, xlsx_path, logo_path=None):
     pdf_path  = Path(pdf_path)
     xlsx_path = Path(xlsx_path)
-
     if not pdf_path.exists():
-        sys.exit(f"Erro: arquivo não encontrado: {pdf_path}")
+        sys.exit(f"Arquivo não encontrado: {pdf_path}")
 
     print(f"📄 Lendo: {pdf_path.name}")
-
     with pdfplumber.open(pdf_path) as pdf:
+        doc_meta   = extract_doc_meta(pdf.pages[0])
         pages_data = [parse_page(p) for p in pdf.pages]
-        first_text = pdf.pages[0].extract_text() or ''
 
-    doc_meta = extract_doc_meta(first_text)
     print(f"   Documento: {doc_meta['title']}")
-    print(f"   Páginas encontradas: {len(pages_data)}")
-
     wb = Workbook()
-    wb.remove(wb.active)  # remove aba default
+    wb.remove(wb.active)
 
     for i, pdata in enumerate(pages_data):
-        # Nome da aba: seção ou "Página N"
-        sheet_name = pdata['section'] or f'Página {i+1}'
-        sheet_name = sheet_name[:31]  # limite do Excel
-        ws = wb.create_sheet(title=sheet_name)
+        name = (pdata['section'] or f'Página {i+1}')[:31]
+        ws   = wb.create_sheet(title=name)
         write_sheet(ws, pdata, doc_meta, logo_path=logo_path)
-        cols = len(pdata['headers'])
-        rows = len(pdata['rows'])
-        print(f"   ✓ Aba '{sheet_name}': {cols} colunas, {rows} linhas de dados")
+        print(f"   ✓ '{name}': {len(pdata['headers'])} colunas, {len(pdata['rows'])} linhas")
 
     wb.save(xlsx_path)
     print(f"\n✅ Salvo em: {xlsx_path}")
 
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Converte PDFs de ensaios agrícolas (GENVCE) em XLSX formatado.'
-    )
-    parser.add_argument('pdf',  help='Caminho do arquivo PDF de entrada')
-    parser.add_argument('xlsx', nargs='?', help='Caminho do arquivo XLSX de saída (opcional)')
-    parser.add_argument('--logo', help='Caminho de uma imagem de logo para inserir nas abas (PNG ou JPEG)')
-    args = parser.parse_args()
-
+    p = argparse.ArgumentParser()
+    p.add_argument('pdf')
+    p.add_argument('xlsx', nargs='?')
+    p.add_argument('--logo')
+    args = p.parse_args()
     pdf_path  = Path(args.pdf)
     xlsx_path = Path(args.xlsx) if args.xlsx else pdf_path.with_suffix('.xlsx')
-
     convert(pdf_path, xlsx_path, logo_path=args.logo)
-
 
 if __name__ == '__main__':
     main()
